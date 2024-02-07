@@ -187,16 +187,23 @@ module HLPTick3 =
         /// compType - the type of the component
         /// position - the top-left corner of the symbol outline.
         /// model - the Sheet model into which the new symbol is added.
-        let placeSymbol (symLabel: string) (compType: ComponentType) (position: XYPos) (model: SheetT.Model) : Result<SheetT.Model, string> =
+        
+        let rnd = System.Random()
+        let placeSymbol (symLabel: string) (compType: ComponentType) (position: XYPos) (rotation:Rotation) (flip:option<SymbolT.FlipType>) (model: SheetT.Model) : Result<SheetT.Model, string> =
             let symLabel = String.toUpper symLabel // make label into its standard casing
             let symModel, symId = SymbolUpdate.addSymbol [] (model.Wire.Symbol) position compType symLabel
-            let sym = symModel.Symbols[symId]
+            let rotateModel = RotateScale.rotateBlock [symId] symModel rotation
+            let flipModel = 
+                match flip with
+                |None -> rotateModel
+                |Some f -> RotateScale.flipBlock [symId] rotateModel f 
+            let sym = flipModel.Symbols[symId]
             match position + sym.getScaledDiagonal with
             | {X=x;Y=y} when x > maxSheetCoord || y > maxSheetCoord ->
                 Error $"symbol '{symLabel}' position {position + sym.getScaledDiagonal} lies outside allowed coordinates"
             | _ ->
                 model
-                |> Optic.set symbolModel_ symModel
+                |> Optic.set symbolModel_ flipModel
                 |> SheetUpdate.updateBoundingBoxes // could optimise this by only updating symId bounding boxes
                 |> Ok
         
@@ -231,7 +238,7 @@ module HLPTick3 =
                         Form = None
                         Description = None
                     }
-                placeSymbol symLabel (Custom ccType) position model
+                placeSymbol symLabel (Custom ccType) position Degree0 None model
             
         
 
@@ -325,15 +332,49 @@ module HLPTick3 =
 
     open Builder
     /// Sample data based on 11 equidistant points on a horizontal line
-    let horizLinePositions =
+    let horizLinePositions: Gen<XYPos> =
         fromList [-100..20..100]
         |> map (fun n -> middleOfSheet + {X=float n; Y=0.})
+    
+    let rectGridPositions (xLen: float) (yLen: float) (num: int) : Gen<XYPos> =
+        let xGrid = fromList [-xLen/2.0 .. xLen/(float (num - 1)) .. xLen/2.0]
+        let yGrid = fromList [-yLen/2.0 .. yLen/(float (num - 1)) .. yLen/2.0]
+        let aLen = 1.5*Sheet.Constants.gridSize/2.
+        let bLen = 2.5*Sheet.Constants.gridSize/2.
+        let checkSymbolOverlap (pos:XYPos):bool=
+            (pos+{X=(-aLen);Y=(-aLen)},pos+{X=aLen;Y=aLen})  
+            |>BlockHelpers.overlap2D (middleOfSheet+{X=(-bLen);Y=(-bLen)},middleOfSheet+{X=bLen;Y=bLen}) 
+        GenerateData.product (fun (x: float) (y: float) -> middleOfSheet + {X=x;Y=y}) xGrid yGrid
+        |>GenerateData.filter (fun x -> not (checkSymbolOverlap x))
+
 
     /// demo test circuit consisting of a DFF & And gate
-    let makeTest1Circuit (andPos:XYPos) =
+    let makeTest1Circuit (flipAndRotate:bool) (andPos:XYPos) =
+        let temp = andPos-middleOfSheet
+        printf $"({string temp.X},{string temp.Y})"
+        let getRandomRotation = 
+            if flipAndRotate then 
+                match rnd.Next(1,5) with
+                    |1  -> Degree0
+                    |2  -> Degree90
+                    |3  -> Degree180
+                    |4  -> Degree270
+                    |_  -> Degree0
+            else 
+                Degree0
+
+        let getRandomFlip =
+            if flipAndRotate then
+                match rnd.Next(1,4) with
+                    |2  -> Some SymbolT.FlipHorizontal
+                    |3  -> Some SymbolT.FlipVertical
+                    |_  -> None
+            else
+                None
+
         initSheetModel
-        |> placeSymbol "G1" (GateN(And,2)) andPos
-        |> Result.bind (placeSymbol "FF1" DFF middleOfSheet)
+        |> placeSymbol "G1" (GateN(And,2)) andPos getRandomRotation getRandomFlip
+        |> Result.bind (placeSymbol "FF1" DFF middleOfSheet getRandomRotation getRandomFlip)
         |> Result.bind (placeWire (portOf "G1" 0) (portOf "FF1" 0))
         |> Result.bind (placeWire (portOf "FF1" 0) (portOf "G1" 0) )
         |> getOkOrFail
@@ -408,7 +449,7 @@ module HLPTick3 =
                 "Horizontally positioned AND + DFF: fail on sample 0"
                 firstSample
                 horizLinePositions
-                makeTest1Circuit
+                (makeTest1Circuit false) 
                 (Asserts.failOnSampleNumber 0)
                 dispatch
             |> recordPositionInTest testNum dispatch
@@ -419,7 +460,7 @@ module HLPTick3 =
                 "Horizontally positioned AND + DFF: fail on sample 10"
                 firstSample
                 horizLinePositions
-                makeTest1Circuit
+                (makeTest1Circuit false)
                 (Asserts.failOnSampleNumber 10)
                 dispatch
             |> recordPositionInTest testNum dispatch
@@ -430,7 +471,7 @@ module HLPTick3 =
                 "Horizontally positioned AND + DFF: fail on symbols intersect"
                 firstSample
                 horizLinePositions
-                makeTest1Circuit
+                (makeTest1Circuit false)
                 Asserts.failOnSymbolIntersectsSymbol
                 dispatch
             |> recordPositionInTest testNum dispatch
@@ -441,10 +482,31 @@ module HLPTick3 =
                 "Horizontally positioned AND + DFF: fail all tests"
                 firstSample
                 horizLinePositions
-                makeTest1Circuit
+                (makeTest1Circuit false)
                 Asserts.failOnAllTests
                 dispatch
             |> recordPositionInTest testNum dispatch
+
+        let test5 testNum firstSample dispatch = 
+            runTestOnSheets
+                "Issie automatic routing"
+                firstSample
+                (rectGridPositions 150 150 20)
+                (makeTest1Circuit false)
+                (Asserts.failOnWireIntersectsSymbol)
+                dispatch
+            |> recordPositionInTest testNum dispatch
+
+        let test6 testNum firstSample dispatch = 
+            runTestOnSheets
+                "Issie automatic routing with arbitary flipping and rotation"
+                firstSample
+                (rectGridPositions 150 150 20)
+                (makeTest1Circuit true)
+                (Asserts.failOnWireIntersectsSymbol)
+                dispatch
+            |> recordPositionInTest testNum dispatch
+
 
         /// List of tests available which can be run ftom Issie File Menu.
         /// The first 9 tests can also be run via Ctrl-n accelerator keys as shown on menu
@@ -456,8 +518,8 @@ module HLPTick3 =
                 "Test2", test2 // example
                 "Test3", test3 // example
                 "Test4", test4 
-                "Test5", fun _ _ _ -> printf "Test5" // dummy test - delete line or replace by real test as needed
-                "Test6", fun _ _ _ -> printf "Test6"
+                "Test5", test5 
+                "Test6", test6
                 "Test7", fun _ _ _ -> printf "Test7"
                 "Test8", fun _ _ _ -> printf "Test8"
                 "Next Test Error", fun _ _ _ -> printf "Next Error:" // Go to the nexterror in a test
